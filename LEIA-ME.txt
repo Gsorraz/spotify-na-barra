@@ -1,0 +1,35 @@
+SPOTIFY NA BARRA
+================
+Mini player que aparece na barra de tarefas do Windows (no espaço vazio à
+direita dos ícones) sempre que o Spotify começa a tocar. Clique nele para
+abrir o painel completo.
+
+INSTALAR (uma vez)
+1. Tenha o Python 3.10 ou mais novo instalado (marque "Add to PATH").
+2. Dê dois cliques em instalar.bat.
+3. Dê dois cliques em iniciar.bat.
+   Dê play no Spotify: o mini player aparece na barra.
+
+QUER UM .EXE?  Rode gerar_exe.bat. O executável fica em dist\SpotifyNaBarra.exe.
+
+USO
+- Clique no mini player: abre/fecha o painel.
+- Botões do mini: anterior / tocar-pausar / próxima. Rodinha do mouse: volume.
+- Arraste o mini para os lados para mudar a posição na barra.
+- Clique direito no mini (ou engrenagem do painel): cor de destaque, esconder
+  ao pausar, posição automática, iniciar com o Windows, Sair.
+- Painel: letra sincronizada (LRCLIB) com ajuste −/+, timer para pausar,
+  volume do Spotify no mixer, troca da saída de áudio do Windows.
+
+PROBLEMAS?
+- O instalar.bat cria a pasta .venv aqui dentro (Python 3.10+; ele escolhe o
+  certo mesmo que o "python" do PATH seja mais antigo). Para reinstalar do
+  zero, apague a pasta .venv e rode o instalar.bat de novo.
+- Erros e avisos ficam em %APPDATA%\SpotifyNaBarra\log.txt.
+
+LIMITAÇÕES
+- O mini player foi feito para a barra de tarefas na parte de baixo da tela.
+- A fila ("A seguir") não é informada pelo Windows; o botão abre o Spotify.
+- Some automaticamente em jogos/vídeos em tela cheia e com a barra oculta.
+- Funciona com o Spotify de desktop (e com navegador, se ativar
+  "Mostrar outros players").
