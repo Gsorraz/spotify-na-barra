@@ -14,12 +14,17 @@ Rodar sem Windows (ou com SB_DEMO=1) abre um modo demonstração.
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import ctypes
+import hashlib
+import http.client
 import json
 import math
 import os
+import queue
 import re
+import secrets
 import sys
 import threading
 import time
@@ -27,6 +32,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from PySide6.QtCore import (QBuffer, QByteArray, QEasingCurve, QEvent, QIODevice, QObject, QPoint,
                             QPropertyAnimation, QRect, QRectF, QSize, Qt, QThread, QTimer, Signal)
@@ -39,7 +45,9 @@ from PySide6.QtWidgets import (QApplication, QFrame, QGraphicsDropShadowEffect, 
                                QWidget)
 
 APP_NAME = "Spotify na Barra"
+APP_VERSAO = "1.0.0"   # maior.menor.correção — aumentar a cada .exe novo (ver testes\logs\HISTORICO_VERSOES.md)
 APP_ID = "SpotifyNaBarra"
+MINI_GAP = 14   # distância mínima (px) entre o último ícone da barra e o mini
 IS_WIN = sys.platform == "win32"
 DEMO = os.environ.get("SB_DEMO") == "1" or not IS_WIN
 
@@ -101,7 +109,7 @@ def setup_log():
         if os.path.exists(path) and os.path.getsize(path) > 200_000:
             os.replace(path, path + ".old")
         sys.stdout = sys.stderr = open(path, "a", encoding="utf-8", buffering=1)
-        print("\n---", datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "---")
+        print("\n---", datetime.now().strftime("%Y-%m-%d %H:%M:%S"), f"--- {APP_NAME} v{APP_VERSAO}")
     except Exception:
         pass
 
@@ -125,6 +133,8 @@ ICONS = {
     "queue": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M8.5 6h12M8.5 12h12M8.5 18h12"/><circle cx="4" cy="6" r=".6" fill="currentColor"/><circle cx="4" cy="12" r=".6" fill="currentColor"/><circle cx="4" cy="18" r=".6" fill="currentColor"/></svg>',
     "device": '<svg viewBox="0 0 34 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M5.6 16.5a8.5 8.5 0 1 1 12.8 0"/><path d="M8.3 14a5 5 0 1 1 7.4 0"/><path d="M12 14.5l4 5.5H8z" fill="currentColor"/><path d="M25 10.5l3.5 3.5 3.5-3.5" stroke-width="1.8"/></svg>',
     "sync": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/></svg>',
+    "heart": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M12 20.3C6.2 16.3 3.5 13 3.5 9.6A4.6 4.6 0 0 1 12 7.4a4.6 4.6 0 0 1 8.5 2.2c0 3.4-2.7 6.7-8.5 10.7z"/></svg>',
+    "heart_on": '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 20.3C6.2 16.3 3.5 13 3.5 9.6A4.6 4.6 0 0 1 12 7.4a4.6 4.6 0 0 1 8.5 2.2c0 3.4-2.7 6.7-8.5 10.7z"/></svg>',
 }
 
 _pix_cache: dict = {}
@@ -241,6 +251,481 @@ def open_spotify():
     except Exception:
         import webbrowser
         webbrowser.open("https://open.spotify.com")
+
+
+# ============================================================================
+# API Web do Spotify (OAuth PKCE, sem client secret)
+# Dá o que o Windows (SMTC) não informa: volume de dentro do Spotify, fila, curtir e
+# aleatório/repetir. É opcional: sem login o app funciona como antes.
+# ============================================================================
+SPOTIFY_CLIENT_ID = "b749a0a5ef3b4891ae2d7e657e41db71"   # público (não é senha); pode ser trocado em spotify.json
+SPOTIFY_REDIRECT = "http://127.0.0.1:8888/callback"      # tem que ser igual ao cadastrado no painel do Spotify
+SPOTIFY_SCOPES = ("user-read-playback-state user-modify-playback-state user-read-currently-playing "
+                  "user-library-read user-library-modify")
+WEB_FILE = os.path.join(APP_DIR, "spotify.json")
+
+
+def _http(method, url, headers=None, form=None, body=None, timeout=8):
+    """(status, json|None, cabeçalhos). Erro HTTP vira status; falha de rede levanta OSError."""
+    data = None
+    h = {"User-Agent": "SpotifyNaBarra/1.0", **(headers or {})}
+    if form is not None:
+        data = urllib.parse.urlencode(form).encode()
+        h["Content-Type"] = "application/x-www-form-urlencoded"
+    elif body is not None:
+        data = json.dumps(body).encode()
+        h["Content-Type"] = "application/json"
+    elif method in ("PUT", "POST", "DELETE"):
+        data = b""  # a API do Spotify exige Content-Length
+    req = urllib.request.Request(url, data=data, headers=h, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw, status, hd = r.read(), r.status, r.headers
+    except urllib.error.HTTPError as e:
+        raw, status, hd = e.read(), e.code, e.headers
+    except http.client.HTTPException as e:   # resposta cortada no meio etc.: tratar como falha de rede
+        raise OSError(str(e)) from e
+    try:
+        return status, (json.loads(raw) if raw else None), hd
+    except ValueError:
+        return status, None, hd
+
+
+def _artists(item) -> str:
+    names = [a.get("name", "") for a in (item.get("artists") or []) if isinstance(a, dict)]
+    if not names:
+        names = [(item.get("show") or {}).get("name", "")]
+    return ", ".join(n for n in names if n)
+
+
+def parse_player(j):
+    """Resposta de GET /me/player -> dict enxuto (None = nenhum dispositivo ativo)."""
+    if not isinstance(j, dict) or not j:
+        return None
+    dev = j.get("device") if isinstance(j.get("device"), dict) else {}
+    item = j.get("item") if isinstance(j.get("item"), dict) else {}
+    vol = dev.get("volume_percent")
+    has_vol = isinstance(vol, (int, float)) and not isinstance(vol, bool)
+    rep = j.get("repeat_state")
+    return {
+        "device": dev.get("name") or "", "dtype": dev.get("type") or "",
+        "volume": max(0.0, min(1.0, vol / 100.0)) if has_vol else None,
+        "can_volume": bool(has_vol and dev.get("supports_volume", True) is not False),
+        "shuffle": bool(j.get("shuffle_state")),
+        "repeat": rep if rep in ("off", "context", "track") else "off",
+        "playing": bool(j.get("is_playing")),
+        "track_id": item.get("id") if (item.get("type") == "track" and not item.get("is_local")) else None,
+        "title": item.get("name") or "", "artist": _artists(item) if item else "",
+        "_t": time.monotonic(),
+    }
+
+
+def parse_queue(j):
+    """Resposta de GET /me/player/queue -> lista [{title, artist}] (até 30)."""
+    out = []
+    for it in ((j or {}).get("queue") or []) if isinstance(j, dict) else []:
+        if isinstance(it, dict):
+            out.append({"title": it.get("name") or "—", "artist": _artists(it)})
+    return out[:30]
+
+
+class _ServidorExclusivo(HTTPServer):
+    allow_reuse_address = False   # no Windows, reutilizar a porta deixaria dois servidores na 8888 sem erro
+
+
+class SpotifyWeb:
+    AUTH_URL = "https://accounts.spotify.com/authorize"
+    TOKEN_URL = "https://accounts.spotify.com/api/token"
+    API_URL = "https://api.spotify.com/v1"
+
+    def __init__(self, path=WEB_FILE):
+        self.path = path
+        self._lock = threading.RLock()
+        self.block_until = 0.0     # 429: não chamar antes disso (time.monotonic)
+        self.revoked = False       # token recusado de vez: pedir login de novo
+        self.cancel = False
+        self._lib_mode = None      # "library" (/me/library) ou "tracks" (/me/tracks): o que o Spotify aceitar
+        self._d = self._read()
+
+    # --- arquivo de tokens ---
+    def _read(self) -> dict:
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+
+    def _save(self):
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._d, f, indent=1)
+            os.replace(tmp, self.path)
+        except Exception as e:
+            print("spotify.json:", e)
+
+    def client_id(self) -> str:
+        return str(self._d.get("client_id") or SPOTIFY_CLIENT_ID).strip()
+
+    def connected(self) -> bool:
+        return bool(self._d.get("refresh_token"))
+
+    def user_name(self) -> str:
+        return str(self._d.get("name") or "")
+
+    def premium_ok(self) -> bool:
+        """Só o plano 'free' bloqueia comandos; desconhecido = tenta."""
+        return str(self._d.get("product") or "").lower() not in ("free", "open")
+
+    def blocked(self) -> bool:
+        return time.monotonic() < self.block_until
+
+    def logout(self):
+        with self._lock:
+            self._d = {k: v for k, v in self._d.items() if k == "client_id"}
+            self._save()
+
+    # --- token ---
+    def _refresh(self) -> bool:
+        d = self._d
+        if not d.get("refresh_token"):
+            return False
+        try:
+            st, r, _ = _http("POST", self.TOKEN_URL, form={
+                "grant_type": "refresh_token", "refresh_token": d["refresh_token"], "client_id": self.client_id()})
+        except OSError as e:
+            print("Spotify API: sem rede ao renovar o token:", e)
+            return False
+        if st == 200 and r and r.get("access_token"):
+            d["access_token"] = r["access_token"]
+            d["expires_at"] = time.time() + int(r.get("expires_in", 3600))
+            if r.get("refresh_token"):
+                d["refresh_token"] = r["refresh_token"]
+            self._save()
+            return True
+        if st in (400, 401) and (r or {}).get("error") == "invalid_grant":
+            print("Spotify API: autorização revogada/expirada; é preciso conectar de novo")
+            self.logout()
+            self.revoked = True
+        else:
+            print(f"Spotify API: não consegui renovar o token ({st})")
+        return False
+
+    def token(self, force=False):
+        with self._lock:
+            d = self._d
+            if not d.get("refresh_token"):
+                return None
+            if not force and d.get("access_token") and d.get("expires_at", 0) - 60 > time.time():
+                return d["access_token"]
+            return self._d.get("access_token") if self._refresh() else None
+
+    def request(self, method, path, params=None, body=None):
+        """(status, json). 0 = sem rede/sem login. 429 respeita o Retry-After."""
+        if self.blocked():
+            return 429, None
+        url = self.API_URL + path + ("?" + urllib.parse.urlencode(params) if params else "")
+        for tentativa in (0, 1):
+            tk = self.token(force=tentativa == 1)
+            if not tk:
+                return 0, None
+            try:
+                st, r, hd = _http(method, url, {"Authorization": "Bearer " + tk}, body=body)
+            except OSError as e:
+                print(f"Spotify API: sem rede em {method} {path}: {e}")
+                return 0, None
+            if st == 401 and tentativa == 0:
+                continue
+            if st == 429:
+                try:
+                    espera = float(hd.get("Retry-After", 5))
+                except (TypeError, ValueError):
+                    espera = 5.0
+                espera = min(max(espera, 1.0), 120.0)
+                self.block_until = time.monotonic() + espera
+                print(f"Spotify API: limite de chamadas (429), aguardando {espera:.0f}s")
+            return st, r
+        return 401, None
+
+    # --- curtir (o Spotify trocou os endpoints; usa o que responder) ---
+    def _lib_call(self, kind, track_id):
+        uri = f"spotify:track:{track_id}"
+        modos = [self._lib_mode] if self._lib_mode else ["library", "tracks"]
+        st, r = 0, None
+        for m in modos:
+            if m == "library":
+                met, cam = {"get": ("GET", "/me/library/contains"), "put": ("PUT", "/me/library"),
+                            "del": ("DELETE", "/me/library")}[kind]
+                par = {"uris": uri}
+            else:
+                met, cam = {"get": ("GET", "/me/tracks/contains"), "put": ("PUT", "/me/tracks"),
+                            "del": ("DELETE", "/me/tracks")}[kind]
+                par = {"ids": track_id}
+            st, r = self.request(met, cam, par)
+            if st in (200, 201, 204):
+                self._lib_mode = m
+                return st, r
+            if st not in (400, 404, 405, 410):   # erro "de verdade" (rede, 403, 429): não adianta tentar o outro
+                break
+        return st, r
+
+    def liked(self, track_id):
+        st, r = self._lib_call("get", track_id)
+        return bool(r[0]) if st == 200 and isinstance(r, list) and r else None
+
+    def set_liked(self, track_id, want: bool) -> bool:
+        st, _ = self._lib_call("put" if want else "del", track_id)
+        return st in (200, 201, 204)
+
+    # --- login (bloqueante: rode numa thread) ---
+    def login(self, timeout=180):
+        """Abre o navegador, espera o retorno em 127.0.0.1:8888 e troca o código pelo token. (ok, mensagem)."""
+        import webbrowser
+        self.cancel = False
+        cid = self.client_id()
+        verificador = secrets.token_urlsafe(64)[:96]
+        desafio = base64.urlsafe_b64encode(hashlib.sha256(verificador.encode()).digest()).rstrip(b"=").decode()
+        estado = secrets.token_urlsafe(16)
+        url = self.AUTH_URL + "?" + urllib.parse.urlencode({
+            "client_id": cid, "response_type": "code", "redirect_uri": SPOTIFY_REDIRECT,
+            "scope": SPOTIFY_SCOPES, "code_challenge_method": "S256", "code_challenge": desafio, "state": estado})
+        recebido: dict = {}
+
+        class Rota(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                p = urllib.parse.urlparse(self.path)
+                if p.path != "/callback":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                recebido.update({k: v[0] for k, v in urllib.parse.parse_qs(p.query).items()})
+                ok = "code" in recebido and not recebido.get("error")
+                msg = ("Spotify na Barra conectado! Pode fechar esta aba." if ok
+                       else "Não foi possível conectar. Volte ao Spotify na Barra e tente de novo.")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(("<!doctype html><meta charset='utf-8'><title>Spotify na Barra</title>"
+                                  "<body style='font-family:Segoe UI,sans-serif;background:#111;color:#fff;"
+                                  f"text-align:center;padding-top:20vh'><h2>{msg}</h2>").encode("utf-8"))
+
+            def log_message(self, format, *args):  # noqa: A002  silencia o servidor
+                pass
+
+        try:
+            srv = _ServidorExclusivo(("127.0.0.1", 8888), Rota)
+        except OSError as e:
+            return False, f"A porta 8888 está ocupada ({e}). Feche o que a usa (ex.: configuração do Jarvis) e tente de novo."
+        srv.timeout = 1
+        try:
+            webbrowser.open(url)
+            fim = time.monotonic() + timeout
+            while not recebido and time.monotonic() < fim and not self.cancel:
+                srv.handle_request()
+        finally:
+            srv.server_close()
+        if self.cancel:
+            return False, "Conexão cancelada."
+        if recebido.get("error") or recebido.get("state") != estado or "code" not in recebido:
+            return False, f"Autorização não concluída ({recebido.get('error', 'sem resposta do navegador')})."
+        try:
+            st, r, _ = _http("POST", self.TOKEN_URL, form={
+                "grant_type": "authorization_code", "code": recebido["code"], "redirect_uri": SPOTIFY_REDIRECT,
+                "client_id": cid, "code_verifier": verificador})
+        except OSError as e:
+            return False, f"Sem conexão com o Spotify: {e}"
+        if st != 200 or not r or "refresh_token" not in r:
+            return False, f"O Spotify recusou o login ({st})."
+        with self._lock:
+            self._d = {"client_id": cid, "access_token": r["access_token"], "refresh_token": r["refresh_token"],
+                       "expires_at": time.time() + int(r.get("expires_in", 3600))}
+            self._save()
+        self.revoked = False
+        st, eu = self.request("GET", "/me")
+        eu = eu if st == 200 and isinstance(eu, dict) else {}
+        with self._lock:
+            self._d["name"] = eu.get("display_name") or eu.get("id") or ""
+            self._d["product"] = eu.get("product") or ""
+            self._save()
+        print(f"Spotify API: conectado como {self._d['name']!r} (plano: {self._d['product'] or 'desconhecido'})")
+        return True, self._d["name"]
+
+
+class SpotifyPoller(threading.Thread):
+    """Thread única da API: consulta o estado (só quando preciso) e executa os comandos em ordem.
+    Fala com a interface por emit(tipo, dado): player, queue, liked, login, logout, limit."""
+
+    def __init__(self, web: SpotifyWeb, emit):
+        super().__init__(daemon=True, name="spotify-api")
+        self.web, self.emit = web, emit
+        self._halt = threading.Event()
+        self._wake = threading.Event()
+        self._lk = threading.Lock()
+        self._cmds = queue.Queue()
+        self._vol_target = None
+        self._vol_sent = 0.0
+        self._last_poll = 0.0
+        self._last_queue = 0.0
+        self._force = False
+        self._force_queue = False
+        self._track_id = None
+        self._warned = set()
+        self._login_thread = None
+        self.panel_open = False
+        self.spotify_on = False
+        self.want_queue = False
+
+    # --- chamadas da interface (thread principal) ---
+    def set_flags(self, panel_open=None, spotify_on=None, want_queue=None):
+        mudou = False
+        if panel_open is not None and panel_open != self.panel_open:
+            mudou = True
+            if panel_open:
+                self._force = True
+            self.panel_open = panel_open
+        if spotify_on is not None and spotify_on != self.spotify_on:
+            mudou = True
+            if spotify_on:
+                self._force = True
+            self.spotify_on = spotify_on
+        if want_queue is not None and want_queue != self.want_queue:
+            mudou = True
+            if want_queue:
+                self._force_queue = True
+            self.want_queue = want_queue
+        if mudou:
+            self._wake.set()
+
+    def volume(self, f: float):
+        with self._lk:
+            self._vol_target = max(0.0, min(1.0, float(f)))
+        self._wake.set()
+
+    def command(self, *c):
+        self._cmds.put(c)
+        self._wake.set()
+
+    def refresh(self):
+        self._force = True
+        self._force_queue = True
+        self._wake.set()
+
+    def login(self):
+        if self._login_thread and self._login_thread.is_alive():
+            return
+        self._login_thread = threading.Thread(target=self._do_login, daemon=True, name="spotify-login")
+        self._login_thread.start()
+
+    def cancel_login(self):
+        self.web.cancel = True
+
+    def logout(self):
+        self.web.logout()
+        self.emit("logout", None)
+
+    def stop(self):
+        self._halt.set()
+        self.web.cancel = True
+        self._wake.set()
+
+    # --- thread ---
+    def _do_login(self):
+        try:
+            ok, msg = self.web.login()
+        except Exception as e:
+            print("Spotify API: erro no login:", repr(e))
+            ok, msg = False, f"Erro inesperado no login: {e}"
+        self.emit("login", (ok, msg))
+        if ok:
+            self.refresh()
+
+    def run(self):
+        while not self._halt.is_set():
+            self._wake.wait(0.3)
+            self._wake.clear()
+            if self._halt.is_set():
+                break
+            try:
+                if self.web.revoked:
+                    self.web.revoked = False
+                    self.emit("logout", "expirou")
+                if not self.web.connected():
+                    continue
+                self._drain()
+                self._poll()
+            except Exception as e:  # a thread da API nunca pode morrer
+                print("Spotify API (thread):", repr(e))
+
+    def _result(self, what, st):
+        if st == 403 and what not in self._warned:
+            self._warned.add(what)
+            print(f"Spotify API: {what} negado (403): plano sem Premium ou dispositivo sem esse controle")
+            self.emit("limit", what)
+
+    def _drain(self):
+        now = time.monotonic()
+        if self._vol_target is not None and now - self._vol_sent >= 0.2 and not self.web.blocked():
+            with self._lk:
+                f, self._vol_target = self._vol_target, None
+            self._vol_sent = now
+            st, _ = self.web.request("PUT", "/me/player/volume", {"volume_percent": int(round(f * 100))})
+            self._result("volume", st)
+            self._force = True
+        while True:
+            try:
+                c = self._cmds.get_nowait()
+            except queue.Empty:
+                break
+            kind = c[0]
+            if kind == "shuffle":
+                st, _ = self.web.request("PUT", "/me/player/shuffle", {"state": "true" if c[1] else "false"})
+                self._result("aleatório", st)
+            elif kind == "repeat":
+                st, _ = self.web.request("PUT", "/me/player/repeat", {"state": c[1]})
+                self._result("repetir", st)
+            elif kind == "like":
+                ok = self.web.set_liked(c[1], bool(c[2]))
+                if not ok:
+                    print("Spotify API: não consegui curtir/descurtir")
+                self.emit("liked", (c[1], bool(c[2]) if ok else not c[2]))
+            self._force = True
+
+    def _poll(self):
+        if self.web.blocked():
+            return
+        now = time.monotonic()
+        periodo = 1.5 if self.panel_open else (6.0 if self.spotify_on else None)
+        if self._force or (periodo is not None and now - self._last_poll >= periodo):
+            self._force = False
+            self._last_poll = now
+            st, j = self.web.request("GET", "/me/player")
+            if st == 429:
+                self._force = True            # tenta de novo assim que o bloqueio acabar
+            elif (st == 200 and isinstance(j, dict)) or st == 204:
+                info = parse_player(j) if st == 200 else None
+                self.emit("player", info)
+                tid = info["track_id"] if info else None
+                if tid != self._track_id:
+                    self._track_id = tid
+                    self._force_queue = True
+                    if tid:
+                        v = self.web.liked(tid)
+                        if v is not None:
+                            self.emit("liked", (tid, v))
+            elif st != 0:
+                print(f"Spotify API: /me/player devolveu {st}")
+        if self.want_queue and self.panel_open and (self._force_queue or now - self._last_queue >= 6.0):
+            self._force_queue = False
+            self._last_queue = now
+            st, j = self.web.request("GET", "/me/player/queue")
+            if st == 200:
+                self.emit("queue", parse_queue(j))
+            elif st == 204:
+                self.emit("queue", [])
+            elif st not in (0, 429):
+                print(f"Spotify API: /me/player/queue devolveu {st}")
 
 
 # ============================================================================
@@ -488,6 +973,69 @@ class DemoWorker(QObject):
         self._emit()
 
 
+SPOTIFY_EXE = "spotify.exe"
+
+
+def spotify_window_open() -> bool:
+    """True se o Spotify de desktop tem uma janela visível (aberto na tela ou minimizado, não só na bandeja).
+    Serve para mostrar o mini player mesmo antes do primeiro play, quando o Windows ainda não tem sessão de mídia."""
+    if DEMO or not IS_WIN:
+        return False
+    try:
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32")
+        u32 = ctypes.WinDLL("user32")      # instância própria: argtypes aqui não afetam o resto do app
+        u32.IsWindowVisible.argtypes = u32.IsIconic.argtypes = [wintypes.HWND]
+        u32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        u32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+
+        class PE(ctypes.Structure):
+            _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
+                        ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", wintypes.DWORD),
+                        ("cntThreads", wintypes.DWORD), ("th32ParentProcessID", wintypes.DWORD),
+                        ("pcPriClassBase", wintypes.LONG), ("dwFlags", wintypes.DWORD),
+                        ("szExeFile", ctypes.c_wchar * 260)]
+        k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        k32.Process32FirstW.argtypes = k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PE)]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        snap = k32.CreateToolhelp32Snapshot(0x2, 0)   # TH32CS_SNAPPROCESS
+        if not snap or snap == wintypes.HANDLE(-1).value:
+            return False
+        pids = set()
+        try:
+            pe = PE(); pe.dwSize = ctypes.sizeof(PE)
+            ok = k32.Process32FirstW(snap, ctypes.byref(pe))
+            while ok:
+                if pe.szExeFile.lower() == SPOTIFY_EXE:
+                    pids.add(pe.th32ProcessID)
+                ok = k32.Process32NextW(snap, ctypes.byref(pe))
+        finally:
+            k32.CloseHandle(snap)
+        if not pids:
+            return False
+        found = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def cb(hwnd, _):
+            if u32.IsWindowVisible(hwnd):
+                pid = wintypes.DWORD()
+                u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if pid.value in pids:
+                    r = wintypes.RECT()
+                    u32.GetWindowRect(hwnd, ctypes.byref(r))
+                    # janela principal (a de verdade); janelas auxiliares invisíveis/minúsculas do Chromium não contam
+                    if (r.right - r.left >= 300 and r.bottom - r.top >= 200) or u32.IsIconic(hwnd):
+                        found.append(hwnd)
+                        return False
+            return True
+        u32.EnumWindows(cb, 0)
+        return bool(found)
+    except Exception as e:
+        print("spotify_window_open:", e)
+        return False
+
+
 # ============================================================================
 # Áudio: volume do Spotify no mixer e saída de áudio do Windows
 # ============================================================================
@@ -615,7 +1163,8 @@ class Audio:
 class Taskbar:
     def __init__(self):
         self.icons_right_phys = None
-        self.user32 = self._load_user32() if IS_WIN else None
+        self.skip_uia = False
+        self.user32 =self._load_user32() if IS_WIN else None
         if IS_WIN and not DEMO:
             threading.Thread(target=self._uia_loop, daemon=True).start()
 
@@ -690,7 +1239,8 @@ class Taskbar:
                     self.icons_right_phys = best_task or best_any
             except Exception:
                 pass
-            time.sleep(2)
+            # leitura rápida para o mini acompanhar os apps abrindo/fechando; devagar com jogo em tela cheia
+            time.sleep(2.0 if self.skip_uia else 0.5)
 
     def info(self):
         """dict: tb (QRect lógico), tray_left, icons_right, hidden, fullscreen"""
@@ -717,6 +1267,7 @@ class Taskbar:
             fs = st.value in (2, 3, 4)  # ocupado / D3D tela cheia / apresentação
         except Exception:
             pass
+        self.skip_uia = hidden or fs
         return {"tb": tb, "tray_left": tray_left, "icons_right": icons_right, "hidden": hidden, "fullscreen": fs}
 
     def keep_on_top(self, widget: QWidget):
@@ -1170,6 +1721,8 @@ class LyricsView(Card):
 
 
 class QueueView(Card):
+    connect_clicked = Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedHeight(230)
@@ -1177,20 +1730,65 @@ class QueueView(Card):
         v.setContentsMargins(18, 16, 18, 16)
         h = QLabel("A seguir"); h.setFont(font(15, QFont.Bold)); h.setStyleSheet("color:#fff;background:transparent")
         v.addWidget(h)
-        v.addStretch()
-        m = QLabel("Nenhuma música a seguir"); m.setFont(font(15)); m.setAlignment(Qt.AlignCenter)
-        m.setStyleSheet("color:#8e8e93;background:transparent")
-        s = QLabel("O Windows não informa a fila do Spotify — abra o app para vê-la.")
-        s.setFont(font(12)); s.setAlignment(Qt.AlignCenter); s.setWordWrap(True)
-        s.setStyleSheet("color:#636366;background:transparent")
-        v.addWidget(m); v.addSpacing(4); v.addWidget(s)
-        b = QPushButton("Abrir reprodutor"); b.setFont(font(13, QFont.DemiBold))
-        b.setCursor(Qt.PointingHandCursor); b.setFocusPolicy(Qt.NoFocus)
-        b.setStyleSheet("QPushButton{color:#fff;background:#1e1e20;border:none;border-radius:15px;padding:7px 16px}QPushButton:hover{background:#2c2c2e}")
-        b.clicked.connect(open_spotify)
-        row = QHBoxLayout(); row.addStretch(); row.addWidget(b); row.addStretch()
-        v.addSpacing(12); v.addLayout(row)
-        v.addStretch()
+        # mensagem (sem fila / sem login)
+        self.box = QWidget()
+        bv = QVBoxLayout(self.box); bv.setContentsMargins(0, 0, 0, 0); bv.setSpacing(0)
+        bv.addStretch()
+        self.msg = QLabel(""); self.msg.setFont(font(15)); self.msg.setAlignment(Qt.AlignCenter)
+        self.msg.setWordWrap(True); self.msg.setStyleSheet("color:#8e8e93;background:transparent")
+        self.sub = QLabel(""); self.sub.setFont(font(12)); self.sub.setAlignment(Qt.AlignCenter)
+        self.sub.setWordWrap(True); self.sub.setStyleSheet("color:#636366;background:transparent")
+        bv.addWidget(self.msg); bv.addSpacing(4); bv.addWidget(self.sub)
+        self.btn = QPushButton("Conectar ao Spotify"); self.btn.setFont(font(13, QFont.DemiBold))
+        self.btn.setCursor(Qt.PointingHandCursor); self.btn.setFocusPolicy(Qt.NoFocus)
+        self.btn.setStyleSheet("QPushButton{color:#fff;background:#1e1e20;border:none;border-radius:15px;padding:7px 16px}QPushButton:hover{background:#2c2c2e}")
+        self.btn.clicked.connect(self.connect_clicked.emit)
+        row = QHBoxLayout(); row.addStretch(); row.addWidget(self.btn); row.addStretch()
+        bv.addSpacing(12); bv.addLayout(row)
+        bv.addStretch()
+        v.addWidget(self.box, 1)
+        # lista
+        self.area = QScrollArea()
+        self.area.setWidgetResizable(True)
+        self.area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.area.setStyleSheet(SCROLL_QSS)
+        self.area.viewport().setAutoFillBackground(False)
+        self.inner = QWidget(); self.inner.setStyleSheet("background:transparent")
+        self.lay = QVBoxLayout(self.inner); self.lay.setContentsMargins(0, 4, 8, 4); self.lay.setSpacing(8)
+        self.lay.addStretch()
+        self.area.setWidget(self.inner)
+        v.addWidget(self.area, 1)
+        self.set_status("offline")
+
+    def set_status(self, kind):
+        """offline: sem login na API | loading | empty | nodevice."""
+        texts = {
+            "offline": ("Conecte o Spotify para ver a fila", "Login único no navegador, sem digitar senha aqui."),
+            "loading": ("Carregando a fila…", ""),
+            "empty": ("Nenhuma música a seguir", ""),
+            "nodevice": ("Nenhum dispositivo do Spotify ativo", "Toque algo no Spotify para ver a fila."),
+        }
+        m, s = texts.get(kind, texts["empty"])
+        self.msg.setText(m); self.sub.setText(s); self.sub.setVisible(bool(s))
+        self.btn.setVisible(kind == "offline")
+        self.box.setVisible(True); self.area.setVisible(False)
+
+    def set_items(self, items):
+        if not items:
+            self.set_status("empty")
+            return
+        while self.lay.count() > 1:
+            w = self.lay.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+        for i, it in enumerate(items):
+            r = QWidget(); r.setStyleSheet("background:transparent")
+            col = QVBoxLayout(r); col.setContentsMargins(0, 0, 0, 0); col.setSpacing(0)
+            t = ElideLabel(14, QFont.DemiBold, "#ffffff"); t.setText(it.get("title", ""))
+            a = ElideLabel(12, QFont.Normal, "#8e8e93"); a.setText(it.get("artist", ""))
+            col.addWidget(t); col.addWidget(a)
+            self.lay.insertWidget(i, r)
+        self.box.setVisible(False); self.area.setVisible(True)
 
 
 # ============================================================================
@@ -1214,7 +1812,7 @@ class PlayerPanel(QWidget):
         super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.ctl = ctl
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setWindowTitle(APP_NAME)
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSAO}")
         self.view = None
         self.anchor = None  # (x_centro, y_base)
 
@@ -1262,11 +1860,17 @@ class PlayerPanel(QWidget):
             l.setFont(font(12)); l.setStyleSheet("color:#8e8e93")
         times.addWidget(self.cur); times.addStretch(); times.addWidget(self.rem)
         meta.addLayout(times); meta.addSpacing(6)
-        ctr = QHBoxLayout(); ctr.setSpacing(30)
+        ctr = QHBoxLayout(); ctr.setSpacing(24)
         self.bprev = IconButton("prev", 40, 28, QSS_PLAIN, "Anterior", "#e5e5ea")
         self.bpp = IconButton("pause", 50, 22, qss_play(25), "Tocar/Pausar", "#000000")
         self.bnext = IconButton("next", 40, 28, QSS_PLAIN, "Próxima", "#e5e5ea")
-        ctr.addStretch(); ctr.addWidget(self.bprev); ctr.addWidget(self.bpp); ctr.addWidget(self.bnext); ctr.addStretch()
+        # coração (curtir): só aparece com a API do Spotify conectada; o espaçador à direita mantém o centro
+        self.heart = IconButton("heart", 40, 22, QSS_PLAIN, "Curtir", "#8e8e93")
+        self.heart_pad = QWidget(); self.heart_pad.setFixedSize(40, 40)
+        self.heart.hide(); self.heart_pad.hide()
+        self.liked = False
+        ctr.addStretch(); ctr.addWidget(self.heart); ctr.addWidget(self.bprev); ctr.addWidget(self.bpp)
+        ctr.addWidget(self.bnext); ctr.addWidget(self.heart_pad); ctr.addStretch()
         meta.addLayout(ctr)
         top.addLayout(meta, 1)
         mv.addLayout(top)
@@ -1281,7 +1885,7 @@ class PlayerPanel(QWidget):
         bottom = QHBoxLayout(); bottom.setSpacing(12)
         self.bvol = IconButton("vol", 30, 22, QSS_PLAIN, "Silenciar", "#e5e5ea")
         self.vbar = VolumeBar()
-        self.vbar.setToolTip("Volume do Spotify no mixer do Windows\n(não é o controle de volume de dentro do Spotify)")
+        self.set_volume_source(False)
         self.bdev = IconButton("device", 46, 22, QSS_PLAIN, "Saída de áudio", "#8e8e93")
         self.bdev.setFixedSize(54, 34)
         self.pl = QPushButton("  Letra"); self.pq = QPushButton("  A seguir")
@@ -1318,6 +1922,8 @@ class PlayerPanel(QWidget):
         self.bdev.clicked.connect(lambda: ctl.device_menu(self.bdev))
         self.pl.clicked.connect(lambda: self.set_view("lyrics"))
         self.pq.clicked.connect(lambda: self.set_view("queue"))
+        self.heart.clicked.connect(ctl.toggle_like)
+        self.queue.connect_clicked.connect(ctl.web_connect)
         self.lyrics.seek.connect(lambda t: ctl.seek(t))
         self.lyrics.offset_step.connect(ctl.change_offset)
         self.relayout()
@@ -1363,12 +1969,30 @@ class PlayerPanel(QWidget):
         self.queue.setVisible(self.view == "queue")
         if self.view == "lyrics":
             self.ctl.ensure_lyrics()
+        self.ctl.web_flags()
         QTimer.singleShot(0, self.relayout)
+
+    def set_volume_source(self, api: bool):
+        self.vbar.setToolTip("Volume de dentro do Spotify (o mesmo da barra do app)" if api else
+                             "Volume do Spotify no mixer do Windows\n(não é o controle de volume de dentro do Spotify)\n"
+                             "Conecte a API do Spotify (engrenagem) para controlar o volume interno.")
+
+    def set_liked(self, show: bool, liked: bool):
+        """Coração: oculto sem API/faixa; cheio na cor de destaque quando curtida."""
+        self.heart.setVisible(show); self.heart_pad.setVisible(show)
+        self.liked = liked
+        self.heart.set_icon("heart_on" if liked else "heart", self.vbar_color() if liked else "#8e8e93")
+        self.heart.setToolTip("Remover das músicas curtidas" if liked else "Curtir")
+
+    def vbar_color(self):
+        return self.prog.accent.name()
 
     def set_accent(self, c: QColor):
         self.prog.accent = c; self.prog.update()
         self.eq.accent = c; self.eq.update()
         g = QColor(c); g.setAlpha(200); self.glow.setColor(g)
+        if self.liked:
+            self.heart.set_icon("heart_on", c.name())
         self.badge.setStyleSheet(f"background:{c.name()};color:#000;border-radius:7px;padding:0 5px")
 
     def set_timer_badge(self, text):
@@ -1429,7 +2053,7 @@ class MiniBar(QWidget):
         super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.ctl = ctl
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setWindowTitle(APP_NAME + " — mini")
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSAO} — mini")
         self.hover = False
         self.accent = QColor("#e8572a")
         self.progress = 0.0
@@ -1527,10 +2151,20 @@ class MiniBar(QWidget):
 # ============================================================================
 class Controller(QObject):
     lyrics_ready = Signal(str, object)
+    web_event = Signal(str, object)     # eventos da thread da API (player, queue, liked, login, logout, limit)
 
     def __init__(self):
         super().__init__()
         self.cfg = Config()
+        self.web = SpotifyWeb()
+        self.web_poll = None
+        self._idle_check_t = 0.0
+        self._idle_open = False
+        self.web_st = None              # último /me/player (parse_player) ou None
+        self.liked = None               # (id da faixa, curtida?) ou None
+        self._vol_hold = 0.0            # até quando ignorar o volume lido (acabamos de mexer)
+        self._pre_mute = None
+        self._limit_told = set()
         self.st = None
         self.ever_played = False
         self.audio = Audio()
@@ -1555,6 +2189,12 @@ class Controller(QObject):
         self.worker.thumb.connect(self._on_thumb)
         self.worker.start()
 
+        # API do Spotify (fora do modo demo, que não tem rede/Spotify de verdade)
+        self.web_poll = None if DEMO else SpotifyPoller(self.web, self.web_event.emit)
+        self.web_event.connect(self._on_web)
+        if self.web_poll:
+            self.web_poll.start()
+
         self.t_tick = QTimer(self); self.t_tick.timeout.connect(self.tick); self.t_tick.start(100)
         self.t_bar = QTimer(self); self.t_bar.timeout.connect(self._bar_step); self.t_bar.start(250)
         self.t_vol = QTimer(self); self.t_vol.timeout.connect(self._poll_volume); self.t_vol.start(1500)
@@ -1569,7 +2209,21 @@ class Controller(QObject):
         p = st["position"] + ((time.monotonic() - st["_t"]) if st["playing"] else 0)
         return min(p, st["duration"]) if st["duration"] else p
 
+    def _idle_state(self):
+        """Spotify aberto mas ainda sem sessão de mídia (nunca tocou nesta sessão do Windows)."""
+        now = time.monotonic()
+        if now - self._idle_check_t > 2.5:      # varrer processos/janelas a cada 0,4 s seria desperdício
+            self._idle_check_t = now
+            self._idle_open = spotify_window_open()
+        if not self._idle_open:
+            return None
+        return {"app": "Spotify.exe", "title": "Spotify", "artist": "Aberto · dê play para começar", "album": "",
+                "playing": False, "position": 0.0, "duration": 0.0, "shuffle": None, "repeat": None,
+                "key": "__idle__", "_t": now, "idle": True}
+
     def _on_state(self, st):
+        if st is None:
+            st = self._idle_state()
         prev_key = self.st["key"] if self.st else None
         self.st = st
         if st is None:
@@ -1587,6 +2241,10 @@ class Controller(QObject):
         self.mini.update_state(st)
         self.panel.update_state(st, self.vol)
         self._update_visibility()
+        if self.web_poll:
+            self.web_flags()
+            if st and st["key"] != prev_key:
+                self._refresh_like()
 
     def _on_thumb(self, data: bytes, key: str):
         self._pending_thumb = (data, key)
@@ -1634,6 +2292,14 @@ class Controller(QObject):
 
     # ---------------- comandos ----------------
     def cmd(self, name, arg=None):
+        if self.st and self.st.get("idle"):
+            # sem sessão de mídia ainda: o Windows não tem a quem mandar o comando; usa as teclas de mídia
+            vk = {"playpause": 0xB3, "next": 0xB0, "prev": 0xB1}.get(name)
+            if vk and IS_WIN:
+                u = ctypes.windll.user32
+                u.keybd_event(vk, 0, 0, 0)
+                u.keybd_event(vk, 0, 2, 0)   # KEYEVENTF_KEYUP
+            return
         self.worker.cmd(name, arg)
 
     def seek(self, t):
@@ -1647,29 +2313,63 @@ class Controller(QObject):
         if self.st and self.st["duration"]:
             self.seek(f * self.st["duration"])
 
+    def api_volume(self):
+        """Volume (0..1) de dentro do Spotify pela API, ou None para usar o mixer do Windows."""
+        if not self.web_poll or not self.web.connected() or not self.web.premium_ok():
+            return None
+        s = self.web_st
+        if s and s["can_volume"] and s["volume"] is not None and time.monotonic() - s["_t"] <= 12:
+            return s["volume"]
+        return None
+
+    def _read_volume(self):
+        av = self.api_volume()
+        if av is not None:
+            return av, av <= 0.001
+        return self.audio.get()
+
     def _poll_volume(self):
-        if self.panel.isVisible() and self.panel.vbar.drag is None:
-            self.vol = self.audio.get()
+        if self.panel.isVisible() and self.panel.vbar.drag is None and time.monotonic() >= self._vol_hold:
+            self.vol = self._read_volume()
+            self.panel.set_volume_source(self.api_volume() is not None)
             self.panel.update_state(self.st, self.vol)
 
     def volume_drag(self, f):
+        if self.api_volume() is not None:
+            self._vol_hold = time.monotonic() + 3
+            self.web_poll.volume(f)      # a thread da API limita a ~5 chamadas por segundo
+            return
         now = time.monotonic()
         if now - self.vol_drag_t > 0.06:
             self.vol_drag_t = now
             self.audio.set(f)
 
     def volume_set(self, f):
-        self.audio.set(f)
+        if self.api_volume() is not None:
+            self._vol_hold = time.monotonic() + 3
+            self.web_poll.volume(f)
+            if self.web_st:
+                self.web_st["volume"] = f   # valor "otimista" até a próxima leitura confirmar
+        else:
+            self.audio.set(f)
         self.vol = (f, f == 0)
         self.panel.update_state(self.st, self.vol)
 
     def volume_wheel(self, direction):
-        cur = self.audio.get()
+        cur = self._read_volume()
         if cur is None:
             return
         self.volume_set(max(0.0, min(1.0, cur[0] + 0.05 * direction)))
 
     def toggle_mute(self):
+        av = self.api_volume()
+        if av is not None:
+            if av > 0.001:
+                self._pre_mute = av
+                self.volume_set(0.0)
+            else:
+                self.volume_set(self._pre_mute or 0.5)
+            return
         self.audio.toggle_mute()
         self.vol = self.audio.get()
         self.panel.update_state(self.st, self.vol)
@@ -1695,6 +2395,9 @@ class Controller(QObject):
 
     def ensure_lyrics(self):
         if not self.st:
+            return
+        if self.st.get("idle"):
+            self.panel.lyrics.message("Dê play no Spotify para ver a letra.")
             return
         key = self.st["key"]
         self.panel.lyrics.show_offset(self.offset())
@@ -1726,7 +2429,7 @@ class Controller(QObject):
     # ---------------- visibilidade e posição ----------------
     def _update_visibility(self):
         st = self.st
-        want = bool(st) and (self.ever_played or st["playing"])
+        want = bool(st) and (self.ever_played or st["playing"] or "spotify" in (st["app"] or "").lower())
         if st and not st["playing"] and self.cfg["hide_on_pause"]:
             want = False
         info = self.taskbar.info()
@@ -1742,6 +2445,10 @@ class Controller(QObject):
 
     def _place_mini(self, info=None):
         if self.mini.dragging:
+            anim = getattr(self, "_mini_anim", None)
+            if anim is not None:
+                anim.stop()
+            self._mini_target = None
             return
         info = info or self.taskbar.info()
         tb = info["tb"]
@@ -1754,18 +2461,41 @@ class Controller(QObject):
             x = info["icons_right"] + 14
         else:
             x = tb.center().x() + 250
+        # Empurrão: o mini fica onde o usuário deixou e só se desloca quando os ícones dos apps
+        # abertos chegam perto dele, mantendo a mesma distância (MINI_GAP) que a barra usa entre ícones.
+        if info["icons_right"]:
+            x = max(x, info["icons_right"] + MINI_GAP)
         right_limit = info["tray_left"] - 10
         if x + w > right_limit:
             w = max(220, right_limit - x)
             if x + w > right_limit:
                 x = right_limit - w
         x = max(tb.left() + 4, x)
-        if self.mini.geometry() != QRect(x, y, w, h):
-            self.mini.setGeometry(x, y, w, h)
+        self._move_mini(QRect(x, y, w, h))
+
+    def _move_mini(self, target: QRect):
+        """Move o mini com uma animação curta (como os ícones do Windows), sem reiniciar a cada tick."""
+        if target == getattr(self, "_mini_target", None):
+            return
+        self._mini_target = target
+        anim = getattr(self, "_mini_anim", None)
+        if anim is not None:
+            anim.stop()
+        cur = self.mini.geometry()
+        if not self.mini.isVisible() or DEMO or abs(cur.x() - target.x()) > 400 or cur.y() != target.y():
+            self.mini.setGeometry(target)
+            return
+        anim = QPropertyAnimation(self.mini, b"geometry", self)
+        anim.setDuration(180)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+        anim.setStartValue(cur)
+        anim.setEndValue(target)
+        self._mini_anim = anim
+        anim.start()
 
     def _bar_step(self):
         self._bar_n += 1
-        if self._bar_n % 4 == 0:
+        if self._bar_n % 2 == 0:
             self._update_visibility()
             if self.mini.isVisible():
                 self._place_mini()
@@ -1793,10 +2523,12 @@ class Controller(QObject):
         g = self.mini.geometry()
         tb = self.taskbar.info()["tb"]
         self.panel.anchor = (g.center().x(), tb.top())
-        self.vol = self.audio.get()
+        self.vol = self._read_volume()
+        self.panel.set_volume_source(self.api_volume() is not None)
         self.panel.update_state(self.st, self.vol)
         self.panel.relayout()
         self.panel.show()
+        self.web_flags()
         self.panel.raise_()
         self.panel.activateWindow()
         self.mouse_was_down = True
@@ -1806,6 +2538,7 @@ class Controller(QObject):
         if self.panel.isVisible():
             self.panel.hide()
             self.panel_hidden_at = time.monotonic()
+            self.web_flags()
 
     def maybe_hide_panel(self):
         if not self.panel.isVisible() or QApplication.activePopupWidget():
@@ -1828,16 +2561,109 @@ class Controller(QObject):
                 self.hide_panel()
         self.mouse_was_down = down
 
+    # ---------------- API do Spotify ----------------
+    def web_flags(self):
+        """Diz à thread da API quando consultar: painel aberto (rápido), Spotify aberto (lento) ou nada."""
+        if not self.web_poll:
+            return
+        self.web_poll.set_flags(panel_open=self.panel.isVisible(), spotify_on=self.st is not None,
+                                want_queue=self.panel.isVisible() and self.panel.view == "queue")
+        if self.panel.view == "queue" and not self.web.connected():
+            self.panel.queue.set_status("offline")
+
+    def web_connect(self):
+        if not self.web_poll:
+            return
+        if self.web.connected():
+            return
+        self.panel.queue.set_status("loading")
+        self.panel.queue.msg.setText("Autorize no navegador…")
+        self.web_poll.login()
+
+    def web_disconnect(self):
+        if self.web_poll:
+            self.web_poll.logout()
+
+    def _live(self):
+        """Estado da API só vale se for recente e a música for a mesma que o Windows mostra."""
+        s = self.web_st
+        if not s or time.monotonic() - s["_t"] > 12 or not self.st:
+            return None
+        a, b = s["title"].strip().lower(), (self.st["title"] or "").strip().lower()
+        return s if a and b and (a == b or a in b or b in a) else None
+
+    def _refresh_like(self):
+        """Mostra/oculta o coração conforme API conectada + faixa conhecida."""
+        s = self._live()
+        show = bool(self.web_poll and self.web.connected() and s and s["track_id"])
+        liked = bool(show and self.liked and self.liked[0] == s["track_id"] and self.liked[1])
+        self.panel.set_liked(show, liked)
+
+    def toggle_like(self):
+        s = self._live()
+        if not (self.web_poll and s and s["track_id"]):
+            return
+        want = not bool(self.liked and self.liked[0] == s["track_id"] and self.liked[1])
+        self.liked = (s["track_id"], want)          # otimista; a thread confirma ou desfaz
+        self._refresh_like()
+        self.web_poll.command("like", s["track_id"], want)
+
+    def _on_web(self, kind, data):
+        if kind == "player":
+            self.web_st = data
+            if time.monotonic() >= self._vol_hold and self.panel.isVisible() and self.panel.vbar.drag is None:
+                self.vol = self._read_volume()
+                self.panel.set_volume_source(self.api_volume() is not None)
+                self.panel.update_state(self.st, self.vol)
+            if self.panel.view == "queue" and data is None and self.web.connected():
+                self.panel.queue.set_status("nodevice")
+            self._refresh_like()
+        elif kind == "queue":
+            if self.panel.view == "queue":
+                self.panel.queue.set_items(data)
+        elif kind == "liked":
+            self.liked = (data[0], data[1])
+            self._refresh_like()
+        elif kind == "login":
+            ok, msg = data
+            if ok:
+                self.panel.set_volume_source(self.api_volume() is not None)
+                self.web_flags()
+                self._refresh_like()
+            else:
+                self.panel.queue.set_status("offline")
+                QMessageBox.warning(None, APP_NAME, "Não consegui conectar ao Spotify.\n\n" + str(msg))
+        elif kind == "logout":
+            self.web_st = None
+            self.liked = None
+            self._refresh_like()
+            self.panel.set_volume_source(False)
+            self.panel.queue.set_status("offline")
+            if data == "expirou":
+                QMessageBox.information(None, APP_NAME, "A conexão com o Spotify expirou. "
+                                        "Conecte de novo pela engrenagem (Conectar ao Spotify).")
+        elif kind == "limit":
+            if data not in self._limit_told:
+                self._limit_told.add(data)
+                print(f"Spotify API: sem permissão para {data}")
+
     # ---------------- menus ----------------
     def more_menu(self, btn):
         m = make_menu(self.panel)
         st = self.st or {}
+        live = self._live() if self.web.premium_ok() else None
         if st.get("shuffle") is not None:
             menu_item(m, "Aleatório", lambda: self.cmd("shuffle", not st.get("shuffle")), bool(st.get("shuffle")))
+        elif live and self.web_poll:      # o Windows não informa: usa a API
+            menu_item(m, "Aleatório", lambda: self.web_poll.command("shuffle", not live["shuffle"]), live["shuffle"])
         if st.get("repeat") is not None:
             names = {0: "Repetir: desligado", 2: "Repetir: playlist", 1: "Repetir: música"}
             nxt = {0: 2, 2: 1, 1: 0}[st["repeat"] if st["repeat"] in (0, 1, 2) else 0]
             menu_item(m, names.get(st["repeat"], "Repetir"), lambda: self.cmd("repeat", nxt), st["repeat"] != 0)
+        elif live and self.web_poll:
+            rn = {"off": "Repetir: desligado", "context": "Repetir: playlist", "track": "Repetir: música"}
+            rx = {"off": "context", "context": "track", "track": "off"}
+            menu_item(m, rn[live["repeat"]], lambda: self.web_poll.command("repeat", rx[live["repeat"]]), live["repeat"] != "off")
         if not m.isEmpty():
             m.addSeparator()
         menu_item(m, "Abrir Spotify", open_spotify)
@@ -1900,6 +2726,16 @@ class Controller(QObject):
         menu_item(m, "Posição automática na barra", lambda: self._set_cfg("manual_offset", None), self.cfg["manual_offset"] is None)
         if IS_WIN:
             menu_item(m, "Iniciar com o Windows", self._toggle_autostart, autostart_enabled())
+        if self.web_poll:
+            m.addSeparator()
+            if self.web.connected():
+                who = self.web.user_name()
+                a = m.addAction("Spotify API: conectado" + (f" ({who})" if who else "")); a.setEnabled(False)
+                if not self.web.premium_ok():
+                    a = m.addAction("Plano gratuito: sem controle de volume/aleatório"); a.setEnabled(False)
+                menu_item(m, "Desconectar do Spotify", self.web_disconnect)
+            else:
+                menu_item(m, "Conectar ao Spotify (volume, fila, curtir)", self.web_connect)
         m.addSeparator()
         menu_item(m, "Sair", QApplication.quit)
         m.exec(gpos)
@@ -1918,6 +2754,8 @@ class Controller(QObject):
 
     def shutdown(self):
         try:
+            if self.web_poll:
+                self.web_poll.stop()
             self.worker.stop()
             self.worker.wait(1500)
         except Exception:

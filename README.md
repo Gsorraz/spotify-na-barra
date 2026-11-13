@@ -15,3 +15,6 @@ Sem Windows (ou com `SB_DEMO=1`) abre em modo demonstração.
 `gerar_exe.bat` → `dist\SpotifyNaBarra.exe`.
 
 Uso, limitações e solução de problemas: `LEIA-ME.txt`. Log em `%APPDATA%\SpotifyNaBarra\log.txt`.
+
+## Versão atual
+**1.0.0**. O número fica em `APP_VERSAO` no código e aparece no título da janela e no log. Para gerar o `.exe`, rode `gerar_exe.ps1`: ele grava a versão nas propriedades do arquivo e recusa repetir um número já usado.

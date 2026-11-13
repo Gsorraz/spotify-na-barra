@@ -21,6 +21,19 @@ USO
 - Painel: letra sincronizada (LRCLIB) com ajuste −/+, timer para pausar,
   volume do Spotify no mixer, troca da saída de áudio do Windows.
 
+CONECTAR AO SPOTIFY (API) - opcional, uma vez só
+- Clique direito no mini (ou engrenagem) > "Conectar ao Spotify" e autorize
+  no navegador. Os tokens ficam em %APPDATA%\SpotifyNaBarra\spotify.json e
+  se renovam sozinhos. "Desconectar" no mesmo menu apaga os tokens.
+- Com a conexão o painel passa a ter: volume de DENTRO do Spotify (sincronizado
+  com a barra do app), fila real em "A seguir", coração de curtir e
+  aleatório/repetir mesmo quando o Windows não informa.
+- Controlar volume/aleatório pela API exige Spotify Premium. Sem Premium (ou sem
+  conectar) tudo continua como antes: volume pelo mixer do Windows.
+- Usa o mesmo aplicativo (Client ID) do Jarvis; o endereço de retorno
+  http://127.0.0.1:8888/callback já está cadastrado. A porta 8888 precisa estar
+  livre só durante o login.
+
 PROBLEMAS?
 - O instalar.bat cria a pasta .venv aqui dentro (Python 3.10+; ele escolhe o
   certo mesmo que o "python" do PATH seja mais antigo). Para reinstalar do
@@ -29,7 +42,7 @@ PROBLEMAS?
 
 LIMITAÇÕES
 - O mini player foi feito para a barra de tarefas na parte de baixo da tela.
-- A fila ("A seguir") não é informada pelo Windows; o botão abre o Spotify.
+- A fila ("A seguir") só aparece depois de conectar a API do Spotify.
 - Some automaticamente em jogos/vídeos em tela cheia e com a barra oculta.
 - Funciona com o Spotify de desktop (e com navegador, se ativar
   "Mostrar outros players").
